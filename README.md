@@ -64,7 +64,7 @@ After the script completes, **log off and log back on** before installing the In
 
 ## Notes
 
-- Version: 1.0
+- Version: 1.1
 - Author: Richard Hicks, [Richard M. Hicks Consulting, Inc.](https://www.richardhicks.com/)
 - The script is digitally signed with a DigiCert code signing certificate.
 
