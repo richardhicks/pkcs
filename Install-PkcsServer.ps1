@@ -1,6 +1,6 @@
 <#PSScriptInfo
 
-.VERSION 1.2
+.VERSION 1.3
 
 .GUID 55f351d8-b3f7-48d8-b847-49a6a7652380
 
@@ -28,10 +28,11 @@
 .DESCRIPTION
     This script performs the following tasks:
 
-    - Disables Internet Explorer enhanced security configuration, which is required for the Intune Certificate Connector installer to run successfully.
-    - Checks if the specified PKCS service account is a member of the local administrators group and adds it if necessary.
-    - Updates the registry to enable the SID security extension on PKCS issued certificates, which is required for proper certificate management in Intune.
+    - Validates the specified PKCS service account by resolving it to a SID before any changes are made to the server.
     - Grants the "Log on as a service" right to the PKCS service account, which is required for the certificate connector service to function properly.
+    - Checks if the specified PKCS service account is a member of the local administrators group and adds it if necessary.
+    - Disables Internet Explorer enhanced security configuration, which is required for the Intune Certificate Connector installer to run successfully.
+    - Updates the registry to enable the SID security extension on PKCS issued certificates, which is required for proper certificate management in Intune.
 
 .PARAMETER ServiceAccount
     Specifies the service account to be used for the PKCS certificate deployment.
@@ -54,15 +55,17 @@
     https://www.richardhicks.com/
 
 .NOTES
-    Version:        1.2
+    Version:        1.3
     Creation Date:  March 5, 2026
-    Last Updated:   May 27, 2026
+    Last Updated:   July 1, 2026
     Author:         Richard Hicks
     Organization:   Richard M. Hicks Consulting, Inc.
     Contact:        rich@richardhicks.com
     Website:        https://www.richardhicks.com/
 
 #>
+
+#Requires -RunAsAdministrator
 
 [CmdletBinding()]
 
@@ -74,24 +77,10 @@ Param(
 
 )
 
-# Requirements
-#Requires -RunAsAdministrator
+# Define LSA API types for granting user rights. Guarded so the script can be run more than once in the same PowerShell session.
+If (-not ('LsaApi' -as [Type])) {
 
-# Define log path
-Write-Verbose 'Starting transcript...'
-$LogPath = "$env:ProgramData\RMHCI\PowerShell"
-
-If (-not (Test-Path -Path $LogPath)) {
-
-    [void](New-Item -Path $LogPath -ItemType Directory -Force)
-
-}
-
-# Start transcript
-Start-Transcript -Path "$LogPath\Install-PkcsServer_$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
-
-# Define LSA API types for granting user rights
-Add-Type @'
+    Add-Type @'
 using System;
 using System.Runtime.InteropServices;
 
@@ -140,31 +129,16 @@ public class LsaApi {
 }
 '@
 
-# Grant the service account the "Log on as a service" right
-Write-Verbose "Granting 'Log on as a service' right to PKCS service account $ServiceAccount..."
+}
 
 Function Grant-LogOnAsService {
 
     Param (
 
-        [string]$ServiceAccount
+        [Parameter(Mandatory)]
+        [System.Security.Principal.SecurityIdentifier]$Sid
 
     )
-
-    # Resolve account name to a SID
-    Try {
-
-        $NtAccount = New-Object System.Security.Principal.NTAccount($ServiceAccount)
-        $Sid = $NtAccount.Translate([System.Security.Principal.SecurityIdentifier])
-
-    }
-
-    Catch {
-
-        Stop-Transcript
-        Throw "Could not resolve account '$ServiceAccount' to a SID. Verify the account exists and the format is 'domain\user'. Error: $_"
-
-    }
 
     # Marshal the SID to unmanaged memory
     $SidBytes = New-Object byte[] $Sid.BinaryLength
@@ -174,19 +148,17 @@ Function Grant-LogOnAsService {
 
     Try {
 
-        $objAttr = New-Object LsaApi+LSA_OBJECT_ATTRIBUTES
-        $objAttr.Length = [System.Runtime.InteropServices.Marshal]::SizeOf($objAttr)
+        $ObjAttr = New-Object LsaApi+LSA_OBJECT_ATTRIBUTES
+        $ObjAttr.Length = [System.Runtime.InteropServices.Marshal]::SizeOf($ObjAttr)
         $EmptyName = New-Object LsaApi+LSA_UNICODE_STRING
         $PolicyHandle = [IntPtr]::Zero
 
         # POLICY_CREATE_ACCOUNT | POLICY_LOOKUP_NAMES = 0x00000010 | 0x00000800
-        $Status = [LsaApi]::LsaOpenPolicy([ref]$EmptyName, [ref]$objAttr, 0x00000810, [ref]$PolicyHandle)
+        $Status = [LsaApi]::LsaOpenPolicy([ref]$EmptyName, [ref]$ObjAttr, 0x00000810, [ref]$PolicyHandle)
 
         If ($Status -ne 0) {
 
-            $WinErr = [LsaApi]::LsaNtStatusToWinError($Status)
-            Stop-Transcript
-            Throw "LsaOpenPolicy failed. Win32 error: $WinErr"
+            Throw "LsaOpenPolicy failed. Win32 error: $([LsaApi]::LsaNtStatusToWinError($Status))"
 
         }
 
@@ -201,13 +173,11 @@ Function Grant-LogOnAsService {
 
             If ($Status -ne 0) {
 
-                $WinErr = [LsaApi]::LsaNtStatusToWinError($Status)
-                Stop-Transcript
-                Throw "LsaAddAccountRights failed. Win32 error: $WinErr"
+                Throw "LsaAddAccountRights failed. Win32 error: $([LsaApi]::LsaNtStatusToWinError($Status))"
 
             }
 
-            Write-Verbose "Successfully granted 'Log on as a service' to '$ServiceAccount' (SID: $($Sid.Value))."
+            Write-Verbose "Successfully granted 'Log on as a service' right (SID: $($Sid.Value))."
 
         }
 
@@ -227,45 +197,90 @@ Function Grant-LogOnAsService {
 
 }
 
-Grant-LogOnAsService -ServiceAccount $ServiceAccount
+# Define log path
+$LogPath = "$env:ProgramData\RMHCI\PowerShell"
 
-# Check local administrators group for PKCS service account
-Write-Verbose "Checking if PKCS service account $ServiceAccount is a member of the local administrators group..."
-$PKCS = Get-LocalGroupMember -Group Administrators -Member $ServiceAccount -ErrorAction SilentlyContinue
+If (-not (Test-Path -Path $LogPath)) {
 
-# Add PKCS service account to local administrators group if required
-If ($Null -eq $PKCS) {
-
-    Write-Verbose "Adding PKCS service account $ServiceAccount to local administrators group..."
-    Add-LocalGroupMember -Group Administrators -Member $ServiceAccount
+    [void](New-Item -Path $LogPath -ItemType Directory -Force)
 
 }
 
-Else {
+# Start transcript
+Write-Verbose 'Starting transcript...'
+Start-Transcript -Path "$LogPath\Install-PkcsServer_$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 
-    Write-Verbose "PKCS service account $ServiceAccount is already a member of the local administrators group."
+Try {
+
+    # Validate the PKCS service account by resolving it to a SID before making any changes to the server
+    Write-Verbose "Validating PKCS service account $ServiceAccount..."
+
+    Try {
+
+        $Sid = (New-Object System.Security.Principal.NTAccount($ServiceAccount)).Translate([System.Security.Principal.SecurityIdentifier])
+
+    }
+
+    Catch {
+
+        Throw "Could not resolve account '$ServiceAccount' to a SID. Verify the account exists and the format is 'domain\user'. Error: $_"
+
+    }
+
+    # Grant the service account the "Log on as a service" right
+    Write-Verbose "Granting 'Log on as a service' right to PKCS service account $ServiceAccount..."
+    Grant-LogOnAsService -Sid $Sid
+
+    # Add PKCS service account to the local administrators group
+    Write-Verbose "Adding PKCS service account $ServiceAccount to the local administrators group..."
+
+    Try {
+
+        Add-LocalGroupMember -Group Administrators -Member $Sid.Value -ErrorAction Stop
+
+    }
+
+    Catch {
+
+        If ($_.FullyQualifiedErrorId -like 'MemberExists*') {
+
+            Write-Verbose "PKCS service account $ServiceAccount is already a member of the local administrators group."
+
+        }
+
+        Else {
+
+            Throw
+
+        }
+
+    }
+
+    # Disable IE enhanced security - required to install the Intune Certificate Connector
+    Write-Verbose 'Disabling IE enhanced security...'
+    Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}' -Name 'IsInstalled' -Type DWORD -Value 0 -ErrorAction Stop
+    Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A8-37EF-4b3f-8CFC-4F3A74704073}' -Name 'IsInstalled' -Type DWORD -Value 0 -ErrorAction Stop
+
+    # Add SID to PKCS issued certificates
+    Write-Verbose 'Updating registry to add SID security extension to PKCS issued certificates...'
+    [void](New-Item -Path 'HKLM:\SOFTWARE\Microsoft\MicrosoftIntune\PFXCertificateConnector' -Force -ErrorAction Stop)
+    Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\MicrosoftIntune\PFXCertificateConnector' -Name 'EnableSidSecurityExtension' -Value 1 -Force -ErrorAction Stop
 
 }
 
-# Disable IE enhanced security - required to install the Intune Certificate Connector
-Write-Verbose 'Disabling IE enhanced security...'
-Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}' -Name 'IsInstalled' -Type DWORD -Value '0'
-Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A8-37EF-4b3f-8CFC-4F3A74704073}' -Name 'IsInstalled' -Type DWORD -Value '0'
+Finally {
 
-# Add SID to PKCS issued certificates
-Write-Verbose 'Updating registry to add SID security extension to PKCS issued certificates...'
-[void](New-Item -Path 'HKLM:\SOFTWARE\Microsoft\MicrosoftIntune\PFXCertificateConnector' -Force)
-Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\MicrosoftIntune\PFXCertificateConnector' -Name EnableSidSecurityExtension -Value 1 -Force
+    Stop-Transcript
 
-Stop-Transcript
+}
 
 Write-Warning 'Be sure to log off and log back on before installing the Intune Certificate Connector.'
 
 # SIG # Begin signature block
 # MIIk7AYJKoZIhvcNAQcCoIIk3TCCJNkCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAjC80XvDQTuPLv
-# z/E9H+6tsGt8sHNZQA1rMVWQJ8MOCKCCH6YwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCB3wwL48xXRozFw
+# RvC/csrJUk5b/Ojz0OywlM0Jv19VAqCCH6YwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -439,24 +454,24 @@ Write-Warning 'Be sure to log off and log back on before installing the Intune C
 # IEc0IENvZGUgU2lnbmluZyBSU0E0MDk2IFNIQTM4NCAyMDIxIENBMQIQDsYrSCrm
 # UJuvTRscProh/zANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3AgEMMQowCKAC
 # gAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisGAQQBgjcCAQsx
-# DjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCBFy1+oiusaUMYYsxpBIt4Z
-# V1niHR4su4DvzGGzTqrgsjALBgcqhkjOPQIBBQAERzBFAiEAu6N7WTZysZ59Y6H6
-# SEit1oUipZqgijmTeqYEDhEezUYCIDY/2X0DbuOj7LIrY2hAW51+xUSDkYh9SOkX
-# J7piy0A/oYIDJjCCAyIGCSqGSIb3DQEJBjGCAxMwggMPAgEBMH0waTELMAkGA1UE
+# DjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCM8BofyH0/cNwnkNUtT9hj
+# nR0ifG8mN71iMrFXu0OpxDALBgcqhkjOPQIBBQAERzBFAiEA1wvAbqkdA/SUvfmY
+# D6ytdezZ3PgUsl5MqMWxkiBDLdgCIDSHJvBGs8Oi4jpdwtksfTf7PY5XLSTw4WxJ
+# yqsI0OlVoYIDJjCCAyIGCSqGSIb3DQEJBjGCAxMwggMPAgEBMH0waTELMAkGA1UE
 # BhMCVVMxFzAVBgNVBAoTDkRpZ2lDZXJ0LCBJbmMuMUEwPwYDVQQDEzhEaWdpQ2Vy
 # dCBUcnVzdGVkIEc0IFRpbWVTdGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENB
 # MQIQCoDvGEuN8QWC0cR2p5V0aDANBglghkgBZQMEAgEFAKBpMBgGCSqGSIb3DQEJ
-# AzELBgkqhkiG9w0BBwEwHAYJKoZIhvcNAQkFMQ8XDTI2MDUyODAwNDQzOFowLwYJ
-# KoZIhvcNAQkEMSIEIPw9yBt3hlR2Kf2sNewR5G834zg8QpBTMZfQFTmjpB8mMA0G
-# CSqGSIb3DQEBAQUABIICAHqqUUe4Jg3s8xUBL4s4RxDndlgD32k/tEt5bG+fWJ4M
-# feZ7YGirbp/nLB1VxxGghfOe728wCwzmBKLHKe1aGP6efRMlevgs1jM5zvCUrhZI
-# 4YHacGqwKLv8xtI7pFhiGbWCPRS7CXfdq3Aj9AYQBovtUK6xts/Mgf/Q5thXoo9n
-# JwHzzoS5m1QFZ13flAJ7cHGoJhKf/bD9VlAygEG5WtSzV8hga1d0D7TdyL/U61/C
-# /FOoNdwcNozbgYEnSOh4mdsOndTgtrTjoc9Vlzi0asQtWnOcKEfcBVMFe8HLMKUS
-# pTUtCjlGjbqeOeqoB2exjYrevCH+HSburLE4/LZ7e0+95ZLhs2sr3KtYIBClW5K+
-# QzySp0/z17SNp9fq+rrP3KYOvzUSP+yYTxc8chHN3FlIAuUkYvvepZYRNdokaAet
-# dtL2KW4qVMs/+46Tqk/7SEbEugAT8sjh4jmbIO/p1akRBMQq9cNsbb/C0LKtZRYo
-# vegHNlxbLmewe1aBkYwAyz4JkRG/1aW3UHNsW/Z9B1eLQxXqppjqDM/L63SLU3rN
-# 2yIjN6T0Hyah2u/pl+tzhdqceIXgubVzpRIqWhqSbHo+ZLGkvG7cfmWJbXE9h/nt
-# P3QorYvEsko93gB7xATiddsdhkGHWMoMbDN6pG/Z5KrJ8CnrxxOXQ5PPS9f7N/hO
+# AzELBgkqhkiG9w0BBwEwHAYJKoZIhvcNAQkFMQ8XDTI2MDcwMjAxMjI1N1owLwYJ
+# KoZIhvcNAQkEMSIEIFiw8RZA698+XkTQq183BejcHtZianWsXRGRNxeewRSiMA0G
+# CSqGSIb3DQEBAQUABIICAHqgFwEXjgcMllM2lYkY8z/McI+kPvQmNwjhT9NB0bnz
+# ReE2fixWhu5y42GWs+BNXDzL/kkXwjNXagc/DMPjXzJt5Si6LnWs8zSobpQW6acp
+# +GDHndXd3S/y3i/YHdWbw7cSk/JgBC7Qo/5oVOjXe9INCFx2fj9QrE2JdBXSNwBX
+# a9NVLLzMnwHRoNnmRwbe32gSjCoyM9S1coEQsaWOY9OsR733vdscRj76DEZnXVbr
+# hv+XHHdhVoWgLRVxrm1ybCoH211w3p4kGj65KBG3DpazFeFCMdQW3RY5Yd0vx1gi
+# PqFUemS31vKzPsTFy/lEIbBFkepxyBxD+FdFd01THVGmTgx5sJEdrw+Om1ayHZMB
+# qpP5Re5eKcL2kDf02QhfIsm+MVQHr+Wnn+4UeUpbXCKHdiboCZki1NJzHWQWgYHg
+# CDkyY3tLhadzExf1LMoJ9ylbe9G7CuiPxi/wpaS9wpfeisaylVBb5GwoOArWCMo/
+# +Utb7Mdmk76Zdg2DYaJsQWMB+2ejnEB/1ZyaG5DFnVAmrzhmZdbeweGKVjPuVD6O
+# xGFYRLoZ8xctUCLiyxFlxrOFW5Fx9BIguU5ylyWrCOhDkydJCfcLyFnhdzdXpPb1
+# Befw8YLF8XaHubsVT4CSYPZyrtFiNzBKPU/c3GuBIXVGziLmTLO+4gL27oFhmmcG
 # SIG # End signature block
